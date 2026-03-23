@@ -4,8 +4,10 @@ import subprocess
 import re
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 import os
+import sys
 from datetime import datetime
 import argparse
 import xml.etree.ElementTree as ET
@@ -188,7 +190,7 @@ class PfSensePlatform(BasePlatform):
         return mapping
 
     def update_cache_files(self, healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings):
-        print("Updating pfSense cache files to reflect gateway health...")
+        log("Updating pfSense cache files to reflect gateway health...")
         ip_to_phys_if_map = mappings['ip_to_phys']
         phys_to_pf_if_map = mappings['phys_to_pf']
         dyndns_id_map = mappings['dyndns_ids']
@@ -207,9 +209,20 @@ class PfSensePlatform(BasePlatform):
                 content_to_write = ip if status == 'healthy' else ip + "\n"
                 try:
                     with open(cache_path, "w") as f: f.write(content_to_write)
-                    print(f"    Wrote {cache_path} for IP {ip} with status '{status}'")
+                    log(f"    Wrote {cache_path} for IP {ip} with status '{status}'")
                 except Exception as e:
                     print(f"    ❌ Error writing {cache_path}: {e}")
+
+# === Output Helper ===
+# Informational messages are routed through log() so that --quiet suppresses them.
+# Error/warning messages always use print() directly.
+
+_quiet = False
+
+def log(msg):
+    if not _quiet:
+        print(msg)
+
 
 # === DNS Provider Abstraction ===
 
@@ -272,15 +285,28 @@ class CloudflareProvider(BaseDNSProvider):
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req) as resp:
-                return json.loads(resp.read())
+                resp_json = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
-            print(f"❌ Cloudflare API error {e.code}: {error_body}")
+            print(f"❌ Cloudflare API HTTP error {e.code} for {method} {path}: {error_body}")
             raise
+
+        if not resp_json.get("success"):
+            errors = resp_json.get("errors", [])
+            messages = resp_json.get("messages", [])
+            print(f"❌ Cloudflare API returned success=false for {method} {path}")
+            for err in errors:
+                print(f"   Error {err.get('code')}: {err.get('message')}")
+            for msg in messages:
+                print(f"   Message: {msg.get('message', msg)}")
+            raise RuntimeError(f"Cloudflare API failure on {method} {path}: {errors}")
+
+        return resp_json
 
     def _get_records(self, record_name, record_type):
         name = record_name.rstrip('.')
-        path = f"/zones/{self.zone_id}/dns_records?name={name}&type={record_type}"
+        query = urllib.parse.urlencode({"name": name, "type": record_type})
+        path = f"/zones/{self.zone_id}/dns_records?{query}"
         result = self._request("GET", path)
         return result.get('result', [])
 
@@ -298,7 +324,24 @@ class CloudflareProvider(BaseDNSProvider):
                 success = False
                 continue
 
-            existing_map = {r['content']: r for r in existing}
+            # Build content -> [records] map; detect and purge duplicates before reconciling
+            existing_by_content = {}
+            for r in existing:
+                existing_by_content.setdefault(r['content'], []).append(r)
+
+            existing_map = {}
+            for content, records in existing_by_content.items():
+                if len(records) > 1:
+                    print(f"⚠️  Found {len(records)} duplicate Cloudflare {record_type} records for {content}; cleaning up extras.")
+                    for dup in records[1:]:
+                        try:
+                            self._request("DELETE", f"/zones/{self.zone_id}/dns_records/{dup['id']}")
+                            log(f"    Deleted duplicate Cloudflare {record_type} record: {content} (id={dup['id']})")
+                        except Exception as e:
+                            print(f"    ❌ Failed to delete duplicate {record_type} record {content}: {e}")
+                            success = False
+                existing_map[content] = records[0]
+
             desired_set = set(ip_list)
             existing_set = set(existing_map.keys())
 
@@ -307,7 +350,7 @@ class CloudflareProvider(BaseDNSProvider):
                 record_id = existing_map[ip]['id']
                 try:
                     self._request("DELETE", f"/zones/{self.zone_id}/dns_records/{record_id}")
-                    print(f"    Deleted Cloudflare {record_type} record: {ip}")
+                    log(f"    Deleted Cloudflare {record_type} record: {ip}")
                 except Exception as e:
                     print(f"    ❌ Failed to delete Cloudflare {record_type} record {ip}: {e}")
                     success = False
@@ -324,15 +367,15 @@ class CloudflareProvider(BaseDNSProvider):
                 if ip in existing_set:
                     record_id = existing_map[ip]['id']
                     try:
-                        self._request("PATCH", f"/zones/{self.zone_id}/dns_records/{record_id}", payload)
-                        print(f"    Updated Cloudflare {record_type} record: {ip}")
+                        self._request("PUT", f"/zones/{self.zone_id}/dns_records/{record_id}", payload)
+                        log(f"    Updated Cloudflare {record_type} record: {ip}")
                     except Exception as e:
                         print(f"    ❌ Failed to update Cloudflare {record_type} record {ip}: {e}")
                         success = False
                 else:
                     try:
                         self._request("POST", f"/zones/{self.zone_id}/dns_records", payload)
-                        print(f"    Created Cloudflare {record_type} record: {ip}")
+                        log(f"    Created Cloudflare {record_type} record: {ip}")
                     except Exception as e:
                         print(f"    ❌ Failed to create Cloudflare {record_type} record {ip}: {e}")
                         success = False
@@ -345,33 +388,21 @@ class CloudflareProvider(BaseDNSProvider):
 def load_config(config_file=None):
     """Load configuration from a JSON file.
 
-    Falls back to hardcoded defaults if the config file is not found,
-    preserving backward compatibility for existing PowerDNS users.
+    Exits with an error message if the config file is not found.
+    Use config.json (see the repository for a template) to configure the script.
     """
     if config_file is None:
         config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
     if os.path.exists(config_file):
-        print(f"Loading configuration from {config_file}")
+        log(f"Loading configuration from {config_file}")
         with open(config_file, 'r') as f:
             return json.load(f)
 
-    print(f"Config file not found at {config_file}, using fallback defaults for backward compatibility.")
-    return {
-        "dns_provider": "powerdns",
-        "powerdns": {
-            "api_url": "https://pdns-api/api/v1",
-            "api_key": "your_api_key_goes_here",
-            "server_id": "localhost",
-            "zone": "example.org."
-        },
-        "dyndns": {
-            "record_name": "home.example.org.",
-            "ttl": 60,
-            "allowed_physical_interfaces": ["em0", "ixl2"]
-        },
-        "state_file": "/var/db/pdns-dyndns.state.json"
-    }
+    print(f"❌ Configuration file not found: {config_file}")
+    print("   Please create a config.json file. See config.json in the repository for a template.")
+    print("   Example: cp /root/config.json.example /root/config.json  (then edit it)")
+    sys.exit(1)
 
 
 # === Generic Application Logic ===
@@ -413,7 +444,7 @@ class DynDNSUpdater:
         )
 
     def run(self):
-        print(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
+        log(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
 
         # 1. Get all system mappings and configs from the platform
         thresholds = self.platform.get_gateway_monitoring_thresholds()
@@ -424,8 +455,8 @@ class DynDNSUpdater:
         if_to_gateway_map = {v: k for k, v in gateway_to_if_map.items()}
         dyndns_id_map = self.platform.get_dyndns_ids()
 
-        print(f"Gateway Thresholds: {thresholds}")
-        print(f"Gateway Statuses: {gateway_statuses}")
+        log(f"Gateway Thresholds: {thresholds}")
+        log(f"Gateway Statuses: {gateway_statuses}")
 
         # 2. Get all public IPs from all interfaces
         all_ipv4 = self.platform.get_public_ipv4_addresses(self.config['allowed_physical_interfaces'])
@@ -450,9 +481,9 @@ class DynDNSUpdater:
         if self.args.ipv4only: healthy_ipv6, unhealthy_ipv6 = [], set()
         if self.args.ipv6only: healthy_ipv4, unhealthy_ipv4 = [], set()
 
-        print(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
+        log(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
         if unhealthy_ipv4 or unhealthy_ipv6:
-            print(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
+            log(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
 
         # 4. Check if an update is needed and execute
         previous_state = self.load_previous_state()
@@ -460,22 +491,22 @@ class DynDNSUpdater:
         ipv6_changed = set(previous_state.get("ipv6", {}).keys()) != set(healthy_ipv6)
 
         if self.args.force_update or ipv4_changed or ipv6_changed:
-            if not self.args.force_update: print("Change detected, performing DNS update...")
-            else: print(f"Forcing DNS update (Reason: {self.args.reason})...")
+            if not self.args.force_update: log("Change detected, performing DNS update...")
+            else: log(f"Forcing DNS update (Reason: {self.args.reason})...")
 
             if self.update_dns(healthy_ipv4, healthy_ipv6):
                 self.save_state(healthy_ipv4, healthy_ipv6)
                 mappings = {'ip_to_phys': ip_to_phys_if_map, 'phys_to_pf': phys_to_pf_if_map, 'dyndns_ids': dyndns_id_map}
                 self.platform.update_cache_files(healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings)
-                print("✅ DNS update and cache files successful.")
+                log("✅ DNS update and cache files successful.")
                 msg = f"DynDNS for {self.config['record_name']} updated.\nHealthy IPs:\nIPv4: {healthy_ipv4}\nIPv6: {healthy_ipv6}"
                 self.send_push_notification("DynDNS Gateway Update", msg)
             else:
                 print("❌ DNS update failed.")
         else:
-            print("No changes detected. Nothing to do.")
+            log("No changes detected. Nothing to do.")
 
-        print("--- DynDNS script finished ---")
+        log("--- DynDNS script finished ---")
 
 
 if __name__ == "__main__":
@@ -489,6 +520,10 @@ if __name__ == "__main__":
     parser.add_argument("--reason", type=str, default="Scheduled", help="Reason for the run (e.g., Gateway-Alarm)")
     parser.add_argument("--config", type=str, default=None, help="Path to config.json (default: config.json next to this script)")
     args = parser.parse_args()
+
+    # Apply quiet flag before any output (including load_config)
+    global _quiet
+    _quiet = args.quiet
 
     # === Configuration ===
     json_config = load_config(args.config)
@@ -507,12 +542,12 @@ if __name__ == "__main__":
         if 'cloudflare' not in json_config:
             raise KeyError("dns_provider is set to 'cloudflare' but the 'cloudflare' section is missing from config.json")
         dns_provider = CloudflareProvider(json_config['cloudflare'])
-        print("Using DNS provider: Cloudflare")
+        log("Using DNS provider: Cloudflare")
     elif provider_name == 'powerdns':
         if 'powerdns' not in json_config:
             raise KeyError("dns_provider is set to 'powerdns' but the 'powerdns' section is missing from config.json")
         dns_provider = PowerDNSProvider(json_config['powerdns'])
-        print("Using DNS provider: PowerDNS")
+        log("Using DNS provider: PowerDNS")
     else:
         raise ValueError(f"Unknown dns_provider '{provider_name}' in config. Supported values: 'cloudflare', 'powerdns'")
 
