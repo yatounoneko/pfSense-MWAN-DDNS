@@ -397,7 +397,13 @@ def load_config(config_file=None):
     if os.path.exists(config_file):
         log(f"Loading configuration from {config_file}")
         with open(config_file, 'r') as f:
-            return json.load(f)
+            try:
+                return json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"❌ Invalid JSON in configuration file: {config_file}")
+                print(f"   {e}")
+                print("   Please fix the syntax error and try again.")
+                sys.exit(1)
 
     print(f"❌ Configuration file not found: {config_file}")
     print("   Please create a config.json file. Copy config.json from the repository and fill in your settings.")
