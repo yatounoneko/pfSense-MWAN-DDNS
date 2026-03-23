@@ -539,16 +539,25 @@ if __name__ == "__main__":
     provider_name = json_config.get('dns_provider', 'powerdns')
     if provider_name == 'cloudflare':
         if 'cloudflare' not in json_config:
-            raise KeyError("dns_provider is set to 'cloudflare' but the 'cloudflare' section is missing from config.json")
+            error_msg = "dns_provider is set to 'cloudflare' but the 'cloudflare' section is missing from config.json"
+            print(f"ERROR: {error_msg}", file=sys.stderr)
+            sys.exit(1)
         dns_provider = CloudflareProvider(json_config['cloudflare'])
         log("Using DNS provider: Cloudflare")
     elif provider_name == 'powerdns':
         if 'powerdns' not in json_config:
-            raise KeyError("dns_provider is set to 'powerdns' but the 'powerdns' section is missing from config.json")
+            error_msg = "dns_provider is set to 'powerdns' but the 'powerdns' section is missing from config.json"
+            print(f"ERROR: {error_msg}", file=sys.stderr)
+            sys.exit(1)
         dns_provider = PowerDNSProvider(json_config['powerdns'])
         log("Using DNS provider: PowerDNS")
     else:
-        raise ValueError(f"Unknown dns_provider '{provider_name}' in config. Supported values: 'cloudflare', 'powerdns'")
+        error_msg = (
+            f"Unknown dns_provider '{provider_name}' in config. "
+            "Supported values: 'cloudflare', 'powerdns'"
+        )
+        print(f"ERROR: {error_msg}", file=sys.stderr)
+        sys.exit(1)
 
     # === Execution ===
     # Instantiate the correct platform implementation
