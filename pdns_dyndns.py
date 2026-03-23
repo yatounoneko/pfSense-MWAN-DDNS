@@ -522,7 +522,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Apply quiet flag before any output (including load_config)
-    global _quiet
     _quiet = args.quiet
 
     # === Configuration ===
