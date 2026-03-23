@@ -169,7 +169,7 @@ While the system is designed to be fully automatic, you can run the main updater
 * `--ipv4only`: Forces the script to ignore all IPv6 addresses. It will only consider healthy IPv4 addresses for the DNS update.
 * `--ipv6only`: Forces the script to ignore all IPv4 addresses. It will only consider healthy IPv6 addresses for the DNS update.
 * `--force-update`: Bypasses the internal state check and forces the script to send a DNS update, even if no IP or gateway status changes have been detected. This is used by the watcher daemon to ensure an update happens after a gateway event.
-* `--quiet`: Suppresses detailed output for a cleaner execution log.
+* `--quiet`: Suppresses normal informational logs for a cleaner execution log. Note: `--dry-run` output is always printed regardless of this flag.
 * `--reason REASON`: A text string used for logging purposes to indicate why the script was run. The watcher daemon uses this to specify that the trigger was a "Gateway-Event".
 * `--config PATH`: Path to a custom `config.json` file. Defaults to `config.json` in the same directory as the script.
 
