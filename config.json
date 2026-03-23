@@ -9,7 +9,7 @@
   },
 
   "powerdns": {
-    "api_url": "http://192.168.1.10:8081/api/v1",
+    "api_url": "https://pdns-api/api/v1",
     "api_key": "your_powerdns_api_key_here",
     "server_id": "localhost",
     "zone": "example.com."

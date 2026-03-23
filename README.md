@@ -79,7 +79,7 @@ Copy `config.json` to `/root/config.json` and fill in your settings. Choose your
 {
   "dns_provider": "powerdns",
   "powerdns": {
-    "api_url": "http://192.168.1.10:8081/api/v1",
+    "api_url": "https://pdns-api/api/v1",
     "api_key": "your_powerdns_api_key",
     "server_id": "localhost",
     "zone": "example.com."
@@ -93,7 +93,7 @@ Copy `config.json` to `/root/config.json` and fill in your settings. Choose your
 }
 ```
 
-* `api_url`: The base URL of your PowerDNS API (e.g., `http://192.168.1.10:8081/api/v1`).
+* `api_url`: The base URL of your PowerDNS API (e.g., `https://pdns-api/api/v1`).
 * `api_key`: Your PowerDNS API key.
 * `server_id`: The server ID for your PowerDNS instance (usually `localhost`).
 * `zone`: The DNS zone you are updating (e.g., `example.com.`). Note the trailing dot (FQDN format).
