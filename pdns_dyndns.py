@@ -400,8 +400,8 @@ def load_config(config_file=None):
             return json.load(f)
 
     print(f"❌ Configuration file not found: {config_file}")
-    print("   Please create a config.json file. See config.json in the repository for a template.")
-    print("   Example: cp /root/config.json.example /root/config.json  (then edit it)")
+    print("   Please create a config.json file. Copy config.json from the repository and fill in your settings.")
+    print("   Example: cp /path/to/repo/config.json /root/config.json  (then edit it)")
     sys.exit(1)
 
 

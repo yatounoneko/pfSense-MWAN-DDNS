@@ -14,7 +14,7 @@ This solution is designed to be fully integrated with pfSense's gateway monitori
 * **Fully Upgrade-Safe**: Does not modify any core pfSense system files, ensuring your configuration survives system updates.
 * **Multiple DNS Providers**: Supports both **PowerDNS** (via its REST API) and **Cloudflare** (via API Token) out of the box, with a clean provider abstraction for easy extension.
 * **Cloudflare Proxy Toggle**: When using Cloudflare, independently control the orange-cloud proxy mode per deployment via a single `proxy` flag in `config.json`.
-* **JSON Configuration**: All settings live in a single `config.json` file — no more editing the script itself. Backward-compatible: if no `config.json` is found, hardcoded defaults are used.
+* **JSON Configuration**: All settings live in a single `config.json` file — no more editing the script itself. A `config.json` file is required; the script exits with a clear error message if it is not found.
 * **Portable Architecture**: Platform-specific code is abstracted into a class, making it significantly easier to port the solution to other systems like OPNsense or OpenWrt.
 
 ## How It Works
@@ -100,7 +100,7 @@ Copy `config.json` to `/root/config.json` and fill in your settings. Choose your
 * `record_name`: The full hostname you want to manage. PowerDNS requires a trailing dot (e.g., `home.example.com.`); Cloudflare does not.
 * `allowed_physical_interfaces`: A list of the physical interface names for your WAN connections (e.g., `["em0", "ixl2"]`). You can find these names in pfSense under **Interfaces > Assignments**.
 
-> **Backward compatibility**: If `config.json` is not present, the script falls back to its built-in hardcoded defaults (PowerDNS). Existing users do not need to make any changes.
+> **`config.json` is required**: If `config.json` is not present, the script exits immediately with a descriptive error and a reminder to create the file. Copy the `config.json` template from the repository and fill in your settings before running the script.
 
 ### Step 3: Configure pfSense DynDNS Service
 
