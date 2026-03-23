@@ -12,7 +12,9 @@ This solution is designed to be fully integrated with pfSense's gateway monitori
 * **Event-Driven Updates**: A watcher daemon provides a near real-time trigger, ensuring DNS updates happen within seconds of a gateway status change.
 * **Visual Status Feedback**: Intentionally uses a quirk in the pfSense DynDNS dashboard widget to color-code cached IPs: **green** for healthy/online and **red** for unhealthy/offline.
 * **Fully Upgrade-Safe**: Does not modify any core pfSense system files, ensuring your configuration survives system updates.
-* **PowerDNS Integration**: Natively updates DNS records via the PowerDNS API.
+* **Multiple DNS Providers**: Supports both **PowerDNS** (via its REST API) and **Cloudflare** (via API Token) out of the box, with a clean provider abstraction for easy extension.
+* **Cloudflare Proxy Toggle**: When using Cloudflare, independently control the orange-cloud proxy mode per deployment via a single `proxy` flag in `config.json`.
+* **JSON Configuration**: All settings live in a single `config.json` file — no more editing the script itself. Backward-compatible: if no `config.json` is found, hardcoded defaults are used.
 * **Portable Architecture**: Platform-specific code is abstracted into a class, making it significantly easier to port the solution to other systems like OPNsense or OpenWrt.
 
 ## How It Works
@@ -30,7 +32,7 @@ This solution consists of two Python scripts that work together:
 ## Prerequisites
 
 * A pfSense firewall with multiple WAN connections configured.
-* A PowerDNS server with its API enabled.
+* A PowerDNS server with its API enabled **or** a Cloudflare account with an API Token that has `Zone:DNS:Edit` permission.
 * SSH access or console access to your pfSense firewall.
 * Python 3.11 or newer installed on pfSense (`pkg install python3.11`).
 
@@ -40,18 +42,65 @@ Follow these steps to set up the entire system.
 
 ### Step 1: Place the Scripts
 
-Place both `gateway_watcher.py` and `pdns_dyndns.py` in the `/root/` directory on your pfSense firewall.
+Place `gateway_watcher.py`, `pdns_dyndns.py`, and `config.json` in the `/root/` directory on your pfSense firewall.
 
-### Step 2: Configure the Updater Script (`pdns_dyndns.py`)
+### Step 2: Create and Edit `config.json`
 
-Open `pdns_dyndns.py` and edit the configuration variables at the bottom of the file (inside the `if __name__ == "__main__":` block):
+Copy `config.json` to `/root/config.json` and fill in your settings. Choose your DNS provider by setting `dns_provider` to either `"cloudflare"` or `"powerdns"`, then fill in the corresponding section.
+
+#### Cloudflare example
+
+```json
+{
+  "dns_provider": "cloudflare",
+  "cloudflare": {
+    "api_token": "your_cloudflare_api_token",
+    "zone_id": "your_zone_id",
+    "proxy": false
+  },
+  "dyndns": {
+    "record_name": "home.example.com",
+    "ttl": 120,
+    "allowed_physical_interfaces": ["em0", "ixl2"]
+  },
+  "state_file": "/var/db/pdns-dyndns.state.json"
+}
+```
+
+* `api_token`: A Cloudflare API Token with the **Zone › DNS › Edit** permission for the target zone.
+* `zone_id`: Your Cloudflare Zone ID (found on the zone's Overview page).
+* `proxy`: `true` to enable Cloudflare's orange-cloud proxy; `false` for DNS-only mode.
+
+> **Note on proxied mode and AAAA records**: When `proxy` is `true`, Cloudflare automatically sets TTL to 1 (Auto) regardless of your `ttl` setting.
+
+#### PowerDNS example
+
+```json
+{
+  "dns_provider": "powerdns",
+  "powerdns": {
+    "api_url": "http://192.168.1.10:8081/api/v1",
+    "api_key": "your_powerdns_api_key",
+    "server_id": "localhost",
+    "zone": "example.com."
+  },
+  "dyndns": {
+    "record_name": "home.example.com.",
+    "ttl": 60,
+    "allowed_physical_interfaces": ["em0", "ixl2"]
+  },
+  "state_file": "/var/db/pdns-dyndns.state.json"
+}
+```
 
 * `api_url`: The base URL of your PowerDNS API (e.g., `http://192.168.1.10:8081/api/v1`).
 * `api_key`: Your PowerDNS API key.
 * `server_id`: The server ID for your PowerDNS instance (usually `localhost`).
-* `zone`: The DNS zone you are updating (e.g., `example.com.`).
-* `record_name`: The full hostname you want to manage (e.g., `home.example.com.`).
+* `zone`: The DNS zone you are updating (e.g., `example.com.`). Note the trailing dot (FQDN format).
+* `record_name`: The full hostname you want to manage. PowerDNS requires a trailing dot (e.g., `home.example.com.`); Cloudflare does not.
 * `allowed_physical_interfaces`: A list of the physical interface names for your WAN connections (e.g., `["em0", "ixl2"]`). You can find these names in pfSense under **Interfaces > Assignments**.
+
+> **Backward compatibility**: If `config.json` is not present, the script falls back to its built-in hardcoded defaults (PowerDNS). Existing users do not need to make any changes.
 
 ### Step 3: Configure pfSense DynDNS Service
 
@@ -116,12 +165,22 @@ While the system is designed to be fully automatic, you can run the main updater
 ### Command-Line Arguments
 
 * `-h, --help`: Shows the help message and a list of all available arguments.
-* `--dry-run`: Performs all checks, including gateway status and IP detection, but does not send any update to the PowerDNS server. This is useful for safely verifying the script's logic.
+* `--dry-run`: Performs all checks, including gateway status and IP detection, but does not send any update to the DNS provider. This is useful for safely verifying the script's logic.
 * `--ipv4only`: Forces the script to ignore all IPv6 addresses. It will only consider healthy IPv4 addresses for the DNS update.
 * `--ipv6only`: Forces the script to ignore all IPv4 addresses. It will only consider healthy IPv6 addresses for the DNS update.
 * `--force-update`: Bypasses the internal state check and forces the script to send a DNS update, even if no IP or gateway status changes have been detected. This is used by the watcher daemon to ensure an update happens after a gateway event.
 * `--quiet`: Suppresses detailed output for a cleaner execution log.
 * `--reason REASON`: A text string used for logging purposes to indicate why the script was run. The watcher daemon uses this to specify that the trigger was a "Gateway-Event".
+* `--config PATH`: Path to a custom `config.json` file. Defaults to `config.json` in the same directory as the script.
+
+## Adding a New DNS Provider
+
+The DNS update logic is abstracted behind `BaseDNSProvider`. To add a new provider:
+
+1. Create a new class (e.g., `Route53Provider`) that inherits from `BaseDNSProvider`.
+2. Implement the `update_records(self, record_name, ipv4_list, ipv6_list, ttl)` method.
+3. Add a corresponding `elif` branch in the `__main__` block's provider selection section.
+4. Add the provider's config section to `config.json`.
 
 ## Porting to Other Platforms (e.g., OPNsense, OpenWrt)
 

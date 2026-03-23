@@ -1,0 +1,26 @@
+{
+  "_comment": "Set 'dns_provider' to 'cloudflare' or 'powerdns'. Only the selected provider's section needs to be filled in.",
+  "dns_provider": "cloudflare",
+
+  "cloudflare": {
+    "api_token": "your_cloudflare_api_token_here",
+    "zone_id": "your_cloudflare_zone_id_here",
+    "proxy": false
+  },
+
+  "powerdns": {
+    "api_url": "http://192.168.1.10:8081/api/v1",
+    "api_key": "your_powerdns_api_key_here",
+    "server_id": "localhost",
+    "zone": "example.com."
+  },
+
+  "dyndns": {
+    "_comment_record_name": "Cloudflare: no trailing dot (e.g. 'home.example.com'). PowerDNS: trailing dot required (e.g. 'home.example.com.').",
+    "record_name": "home.example.com",
+    "ttl": 120,
+    "allowed_physical_interfaces": ["em0", "ixl2"]
+  },
+
+  "state_file": "/var/db/pdns-dyndns.state.json"
+}

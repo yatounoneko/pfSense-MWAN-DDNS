@@ -211,13 +211,177 @@ class PfSensePlatform(BasePlatform):
                 except Exception as e:
                     print(f"    ❌ Error writing {cache_path}: {e}")
 
+# === DNS Provider Abstraction ===
+
+class BaseDNSProvider:
+    """Abstract base class defining the interface for DNS provider implementations."""
+    def update_records(self, record_name, ipv4_list, ipv6_list, ttl):
+        raise NotImplementedError
+
+
+class PowerDNSProvider(BaseDNSProvider):
+    """DNS provider implementation for PowerDNS."""
+
+    def __init__(self, config):
+        self.api_url = config['api_url']
+        self.api_key = config['api_key']
+        self.server_id = config.get('server_id', 'localhost')
+        self.zone = config['zone']
+
+    def update_records(self, record_name, ipv4_list, ipv6_list, ttl):
+        rrsets = [
+            {"name": record_name, "type": "A", "ttl": ttl, "changetype": "REPLACE",
+             "records": [{"content": ip, "disabled": False} for ip in ipv4_list]},
+            {"name": record_name, "type": "AAAA", "ttl": ttl, "changetype": "REPLACE",
+             "records": [{"content": ip, "disabled": False} for ip in ipv6_list]}
+        ]
+        try:
+            zone_url = f"{self.api_url}/servers/{self.server_id}/zones/{self.zone}"
+            data = json.dumps({"rrsets": rrsets}).encode("utf-8")
+            req = urllib.request.Request(zone_url, data=data,
+                                         headers={"X-API-Key": self.api_key, "Content-Type": "application/json"},
+                                         method="PATCH")
+            with urllib.request.urlopen(req) as response:
+                return response.status == 204
+        except Exception as e:
+            print(f"❌ Exception during PowerDNS update: {e}")
+            return False
+
+
+class CloudflareProvider(BaseDNSProvider):
+    """DNS provider implementation for Cloudflare API v4.
+
+    Manages multiple A/AAAA records under a single hostname, with support for
+    the Cloudflare proxy (orange-cloud) toggle via the 'proxy' config option.
+    """
+
+    CF_API_BASE = "https://api.cloudflare.com/client/v4"
+
+    def __init__(self, config):
+        self.api_token = config['api_token']
+        self.zone_id = config['zone_id']
+        self.proxied = config.get('proxy', False)
+
+    def _request(self, method, path, data=None):
+        url = f"{self.CF_API_BASE}{path}"
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        body = json.dumps(data).encode('utf-8') if data is not None else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            print(f"❌ Cloudflare API error {e.code}: {error_body}")
+            raise
+
+    def _get_records(self, record_name, record_type):
+        name = record_name.rstrip('.')
+        path = f"/zones/{self.zone_id}/dns_records?name={name}&type={record_type}"
+        result = self._request("GET", path)
+        return result.get('result', [])
+
+    def update_records(self, record_name, ipv4_list, ipv6_list, ttl):
+        name = record_name.rstrip('.')
+        # Cloudflare enforces TTL=1 (Auto) for proxied records
+        effective_ttl = 1 if self.proxied else ttl
+        success = True
+
+        for record_type, ip_list in [("A", ipv4_list), ("AAAA", ipv6_list)]:
+            try:
+                existing = self._get_records(record_name, record_type)
+            except Exception as e:
+                print(f"❌ Failed to retrieve existing Cloudflare {record_type} records: {e}")
+                success = False
+                continue
+
+            existing_map = {r['content']: r for r in existing}
+            desired_set = set(ip_list)
+            existing_set = set(existing_map.keys())
+
+            # Delete records that are no longer needed
+            for ip in existing_set - desired_set:
+                record_id = existing_map[ip]['id']
+                try:
+                    self._request("DELETE", f"/zones/{self.zone_id}/dns_records/{record_id}")
+                    print(f"    Deleted Cloudflare {record_type} record: {ip}")
+                except Exception as e:
+                    print(f"    ❌ Failed to delete Cloudflare {record_type} record {ip}: {e}")
+                    success = False
+
+            # Create new records or update existing ones
+            for ip in desired_set:
+                payload = {
+                    "type": record_type,
+                    "name": name,
+                    "content": ip,
+                    "ttl": effective_ttl,
+                    "proxied": self.proxied
+                }
+                if ip in existing_set:
+                    record_id = existing_map[ip]['id']
+                    try:
+                        self._request("PATCH", f"/zones/{self.zone_id}/dns_records/{record_id}", payload)
+                        print(f"    Updated Cloudflare {record_type} record: {ip}")
+                    except Exception as e:
+                        print(f"    ❌ Failed to update Cloudflare {record_type} record {ip}: {e}")
+                        success = False
+                else:
+                    try:
+                        self._request("POST", f"/zones/{self.zone_id}/dns_records", payload)
+                        print(f"    Created Cloudflare {record_type} record: {ip}")
+                    except Exception as e:
+                        print(f"    ❌ Failed to create Cloudflare {record_type} record {ip}: {e}")
+                        success = False
+
+        return success
+
+
+# === Configuration Loading ===
+
+def load_config(config_file=None):
+    """Load configuration from a JSON file.
+
+    Falls back to hardcoded defaults if the config file is not found,
+    preserving backward compatibility for existing PowerDNS users.
+    """
+    if config_file is None:
+        config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+    if os.path.exists(config_file):
+        print(f"Loading configuration from {config_file}")
+        with open(config_file, 'r') as f:
+            return json.load(f)
+
+    print(f"Config file not found at {config_file}, using fallback defaults for backward compatibility.")
+    return {
+        "dns_provider": "powerdns",
+        "powerdns": {
+            "api_url": "https://pdns-api/api/v1",
+            "api_key": "your_api_key_goes_here",
+            "server_id": "localhost",
+            "zone": "example.org."
+        },
+        "dyndns": {
+            "record_name": "home.example.org.",
+            "ttl": 60,
+            "allowed_physical_interfaces": ["em0", "ixl2"]
+        },
+        "state_file": "/var/db/pdns-dyndns.state.json"
+    }
+
+
 # === Generic Application Logic ===
 
 class DynDNSUpdater:
-    def __init__(self, platform, config, args):
+    def __init__(self, platform, config, args, dns_provider):
         self.platform = platform
         self.config = config
         self.args = args
+        self.dns_provider = dns_provider
 
     def send_push_notification(self, subject, message):
         safe_message = message.replace('"', '\\"').replace("`", "'")
@@ -238,19 +402,15 @@ class DynDNSUpdater:
         with open(self.config['state_file'], "w") as f: json.dump(state, f)
 
     def update_dns(self, ipv4_addresses, ipv6_addresses):
-        rrsets = [
-            {"name": self.config['record_name'], "type": "A", "ttl": self.config['ttl'], "changetype": "REPLACE", "records": [{"content": ip, "disabled": False} for ip in ipv4_addresses]},
-            {"name": self.config['record_name'], "type": "AAAA", "ttl": self.config['ttl'], "changetype": "REPLACE", "records": [{"content": ip, "disabled": False} for ip in ipv6_addresses]}
-        ]
-        try:
-            zone_url = f"{self.config['api_url']}/servers/{self.config['server_id']}/zones/{self.config['zone']}"
-            data = json.dumps({"rrsets": rrsets}).encode("utf-8")
-            req = urllib.request.Request(zone_url, data=data, headers={"X-API-Key": self.config['api_key'], "Content-Type": "application/json"}, method="PATCH")
-            with urllib.request.urlopen(req) as response:
-                return response.status == 204
-        except Exception as e:
-            print(f"❌ Exception during PowerDNS update: {e}")
-            return False
+        if self.args.dry_run:
+            print(f"[DRY-RUN] Would update DNS: record={self.config['record_name']}, IPv4={ipv4_addresses}, IPv6={ipv6_addresses}")
+            return True
+        return self.dns_provider.update_records(
+            self.config['record_name'],
+            ipv4_addresses,
+            ipv6_addresses,
+            self.config['ttl']
+        )
 
     def run(self):
         print(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
@@ -319,18 +479,6 @@ class DynDNSUpdater:
 
 
 if __name__ == "__main__":
-    # === Configuration ===
-    config = {
-        api_url = "https://pdns-api/api/v1"
-        api_key = "your_api_key_goes_here"
-        server_id = "localhost"
-        zone = "example.org."
-        record_name = "home.example.org."
-        ttl = 60
-        state_file = "/var/db/pdns-dyndns.state.json"
-        allowed_physical_interfaces = ["em0", "ixl2"]
-    }
-
     # === Argument Parsing ===
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done, but do not update")
@@ -339,10 +487,37 @@ if __name__ == "__main__":
     parser.add_argument("--force-update", action="store_true", help="Always run DNS update, even without detected IP change")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument("--reason", type=str, default="Scheduled", help="Reason for the run (e.g., Gateway-Alarm)")
+    parser.add_argument("--config", type=str, default=None, help="Path to config.json (default: config.json next to this script)")
     args = parser.parse_args()
+
+    # === Configuration ===
+    json_config = load_config(args.config)
+
+    dyndns_cfg = json_config.get('dyndns', {})
+    config = {
+        'record_name': dyndns_cfg.get('record_name', 'home.example.org.'),
+        'ttl': dyndns_cfg.get('ttl', 60),
+        'allowed_physical_interfaces': dyndns_cfg.get('allowed_physical_interfaces', []),
+        'state_file': json_config.get('state_file', '/var/db/pdns-dyndns.state.json'),
+    }
+
+    # === DNS Provider Selection ===
+    provider_name = json_config.get('dns_provider', 'powerdns')
+    if provider_name == 'cloudflare':
+        if 'cloudflare' not in json_config:
+            raise KeyError("dns_provider is set to 'cloudflare' but the 'cloudflare' section is missing from config.json")
+        dns_provider = CloudflareProvider(json_config['cloudflare'])
+        print("Using DNS provider: Cloudflare")
+    elif provider_name == 'powerdns':
+        if 'powerdns' not in json_config:
+            raise KeyError("dns_provider is set to 'powerdns' but the 'powerdns' section is missing from config.json")
+        dns_provider = PowerDNSProvider(json_config['powerdns'])
+        print("Using DNS provider: PowerDNS")
+    else:
+        raise ValueError(f"Unknown dns_provider '{provider_name}' in config. Supported values: 'cloudflare', 'powerdns'")
 
     # === Execution ===
     # Instantiate the correct platform implementation
     platform = PfSensePlatform()
-    updater = DynDNSUpdater(platform, config, args)
+    updater = DynDNSUpdater(platform, config, args, dns_provider)
     updater.run()
