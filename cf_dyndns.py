@@ -13,8 +13,8 @@ import glob
 
 # === Platform Abstraction ===
 # To port this script to another platform (like OPNsense or OpenWrt),
-# you would create a new class that inherits from BasePlatform and
-# implement all of its methods with OS-specific logic.
+# create a new class that inherits from BasePlatform and implement all
+# methods with OS-specific logic.
 
 class BasePlatform:
     """Abstract base class defining the interface for platform-specific functions."""
@@ -192,7 +192,7 @@ class PfSensePlatform(BasePlatform):
         ip_to_phys_if_map = mappings['ip_to_phys']
         phys_to_pf_if_map = mappings['phys_to_pf']
         dyndns_id_map = mappings['dyndns_ids']
-        
+
         all_ips_to_process = { 'healthy': healthy_ipv4 + healthy_ipv6, 'unhealthy': list(unhealthy_ipv4) + list(unhealthy_ipv6) }
         for status, ip_list in all_ips_to_process.items():
             for ip in ip_list:
@@ -202,7 +202,7 @@ class PfSensePlatform(BasePlatform):
                 if not pf_iface: continue
                 dyndns_id = dyndns_id_map.get(pf_iface)
                 if dyndns_id is None: continue
-                
+
                 cache_path = f"/conf/dyndns_{pf_iface}custom''{dyndns_id}.cache"
                 content_to_write = ip if status == 'healthy' else ip + "\n"
                 try:
@@ -211,21 +211,128 @@ class PfSensePlatform(BasePlatform):
                 except Exception as e:
                     print(f"    ❌ Error writing {cache_path}: {e}")
 
-# === Generic Application Logic ===
+# === Cloudflare DNS Updater ===
 
-class DynDNSUpdater:
+class CloudflareDynDNS:
+    """Updates Cloudflare DNS A/AAAA records using the Cloudflare API v4."""
+
+    CF_API_BASE = "https://api.cloudflare.com/client/v4"
+
     def __init__(self, platform, config, args):
         self.platform = platform
         self.config = config
         self.args = args
 
-    def send_push_notification(self, subject, message):
-        safe_message = message.replace('"', '\\"').replace("`", "'")
-        php_code = f"""require_once("/etc/inc/notices.inc"); file_notice("dynupdate", "{safe_message}", "DynDNS", "", 1, false);"""
+    def _api_request(self, method, path, data=None):
+        url = f"{self.CF_API_BASE}{path}"
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        headers = {
+            "Authorization": f"Bearer {self.config['api_token']}",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            subprocess.run(["/usr/local/bin/php", "-r", php_code], check=True)
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", errors="replace")
+            print(f"❌ Cloudflare API {method} {path} returned HTTP {e.code}: {body_text}")
+            return None
         except Exception as e:
-            print(f"Push-Nachricht konnte nicht gesendet werden: {e}")
+            print(f"❌ Cloudflare API {method} {path} exception: {e}")
+            return None
+
+    def _list_records(self, record_type):
+        name = self.config['record_name'].rstrip('.')
+        path = f"/zones/{self.config['zone_id']}/dns_records?type={record_type}&name={name}&per_page=100"
+        result = self._api_request("GET", path)
+        if result and result.get("success"):
+            return result.get("result", [])
+        return []
+
+    def _create_record(self, record_type, ip):
+        effective_ttl = 1 if self.config.get('proxied', False) else self.config['ttl']
+        data = {
+            "type": record_type,
+            "name": self.config['record_name'].rstrip('.'),
+            "content": ip,
+            "ttl": effective_ttl,
+            "proxied": self.config.get('proxied', False),
+        }
+        result = self._api_request("POST", f"/zones/{self.config['zone_id']}/dns_records", data)
+        if result and result.get("success"):
+            print(f"    ✅ Created {record_type} record: {ip}")
+            return True
+        print(f"    ❌ Failed to create {record_type} record: {ip}")
+        return False
+
+    def _update_record(self, record_id, record_type, ip):
+        effective_ttl = 1 if self.config.get('proxied', False) else self.config['ttl']
+        data = {
+            "type": record_type,
+            "name": self.config['record_name'].rstrip('.'),
+            "content": ip,
+            "ttl": effective_ttl,
+            "proxied": self.config.get('proxied', False),
+        }
+        result = self._api_request("PUT", f"/zones/{self.config['zone_id']}/dns_records/{record_id}", data)
+        if result and result.get("success"):
+            print(f"    ✅ Updated {record_type} record: {ip}")
+            return True
+        print(f"    ❌ Failed to update {record_type} record: {ip}")
+        return False
+
+    def _delete_record(self, record_id, record_type, ip):
+        result = self._api_request("DELETE", f"/zones/{self.config['zone_id']}/dns_records/{record_id}")
+        if result and result.get("success"):
+            print(f"    ✅ Deleted {record_type} record: {ip}")
+            return True
+        print(f"    ❌ Failed to delete {record_type} record: {ip}")
+        return False
+
+    def _sync_records(self, record_type, desired_ips):
+        """Synchronise Cloudflare records of the given type to exactly match desired_ips."""
+        existing = self._list_records(record_type)
+        existing_by_ip = {r["content"]: r for r in existing}
+        desired_set = set(desired_ips)
+        existing_set = set(existing_by_ip.keys())
+
+        to_add = desired_set - existing_set
+        to_remove = existing_set - desired_set
+        to_keep = desired_set & existing_set
+
+        success = True
+
+        # Update records that already exist and may need TTL/proxied adjustment
+        for ip in to_keep:
+            rec = existing_by_ip[ip]
+            effective_ttl = 1 if self.config.get('proxied', False) else self.config['ttl']
+            needs_update = (
+                rec.get("proxied") != self.config.get('proxied', False)
+                or rec.get("ttl") != effective_ttl
+            )
+            if needs_update:
+                if not self._update_record(rec["id"], record_type, ip):
+                    success = False
+
+        for ip in to_add:
+            if not self._create_record(record_type, ip):
+                success = False
+
+        for ip in to_remove:
+            rec = existing_by_ip[ip]
+            if not self._delete_record(rec["id"], record_type, ip):
+                success = False
+
+        return success
+
+    def update_dns(self, ipv4_addresses, ipv6_addresses):
+        success = True
+        if not self._sync_records("A", ipv4_addresses):
+            success = False
+        if not self._sync_records("AAAA", ipv6_addresses):
+            success = False
+        return success
 
     def load_previous_state(self):
         if os.path.exists(self.config['state_file']):
@@ -237,23 +344,8 @@ class DynDNSUpdater:
         state = { "ipv4": {ip: timestamp for ip in ipv4}, "ipv6": {ip: timestamp for ip in ipv6} }
         with open(self.config['state_file'], "w") as f: json.dump(state, f)
 
-    def update_dns(self, ipv4_addresses, ipv6_addresses):
-        rrsets = [
-            {"name": self.config['record_name'], "type": "A", "ttl": self.config['ttl'], "changetype": "REPLACE", "records": [{"content": ip, "disabled": False} for ip in ipv4_addresses]},
-            {"name": self.config['record_name'], "type": "AAAA", "ttl": self.config['ttl'], "changetype": "REPLACE", "records": [{"content": ip, "disabled": False} for ip in ipv6_addresses]}
-        ]
-        try:
-            zone_url = f"{self.config['api_url']}/servers/{self.config['server_id']}/zones/{self.config['zone']}"
-            data = json.dumps({"rrsets": rrsets}).encode("utf-8")
-            req = urllib.request.Request(zone_url, data=data, headers={"X-API-Key": self.config['api_key'], "Content-Type": "application/json"}, method="PATCH")
-            with urllib.request.urlopen(req) as response:
-                return response.status == 204
-        except Exception as e:
-            print(f"❌ Exception during PowerDNS update: {e}")
-            return False
-
     def run(self):
-        print(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
+        print(f"--- cf_dyndns started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
 
         # 1. Get all system mappings and configs from the platform
         thresholds = self.platform.get_gateway_monitoring_thresholds()
@@ -303,46 +395,45 @@ class DynDNSUpdater:
             if not self.args.force_update: print("Change detected, performing DNS update...")
             else: print(f"Forcing DNS update (Reason: {self.args.reason})...")
 
-            if self.update_dns(healthy_ipv4, healthy_ipv6):
+            if self.args.dry_run:
+                print(f"[DRY-RUN] Would update Cloudflare DNS for {self.config['record_name']}: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
+            elif self.update_dns(healthy_ipv4, healthy_ipv6):
                 self.save_state(healthy_ipv4, healthy_ipv6)
                 mappings = {'ip_to_phys': ip_to_phys_if_map, 'phys_to_pf': phys_to_pf_if_map, 'dyndns_ids': dyndns_id_map}
                 self.platform.update_cache_files(healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings)
-                print("✅ DNS update and cache files successful.")
-                msg = f"DynDNS for {self.config['record_name']} updated.\nHealthy IPs:\nIPv4: {healthy_ipv4}\nIPv6: {healthy_ipv6}"
-                self.send_push_notification("DynDNS Gateway Update", msg)
+                print("✅ Cloudflare DNS update and cache files successful.")
             else:
-                print("❌ DNS update failed.")
+                print("❌ Cloudflare DNS update failed.")
         else:
             print("No changes detected. Nothing to do.")
 
-        print("--- DynDNS script finished ---")
+        print("--- cf_dyndns finished ---")
 
 
 if __name__ == "__main__":
     # === Configuration ===
+    # Edit these values to match your Cloudflare setup.
     config = {
-        "api_url": "https://pdns-api/api/v1",
-        "api_key": "your_api_key_goes_here",
-        "server_id": "localhost",
-        "zone": "example.org.",
-        "record_name": "home.example.org.",
-        "ttl": 60,
-        "state_file": "/var/db/pdns-dyndns.state.json",
+        "api_token": "your_cloudflare_api_token_here",  # Needs Zone:DNS:Edit permission
+        "zone_id": "your_cloudflare_zone_id_here",
+        "record_name": "home.example.org",              # Do NOT include a trailing dot
+        "ttl": 60,                                       # TTL in seconds; ignored when proxied=True (Cloudflare forces Auto/1)
+        "proxied": False,                                # Set True to enable Cloudflare proxy (orange cloud)
+        "state_file": "/var/db/cf-dyndns.state.json",
         "allowed_physical_interfaces": ["em0", "ixl2"],
     }
 
     # === Argument Parsing ===
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be done, but do not update")
-    parser.add_argument("--ipv4only", action="store_true", help="Only use IPv4")
-    parser.add_argument("--ipv6only", action="store_true", help="Only use IPv6")
-    parser.add_argument("--force-update", action="store_true", help="Always run DNS update, even without detected IP change")
+    parser = argparse.ArgumentParser(description="Cloudflare DynDNS updater for pfSense Multi-WAN.")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would be done, but do not update Cloudflare")
+    parser.add_argument("--ipv4only", action="store_true", help="Only use IPv4 (ignore IPv6)")
+    parser.add_argument("--ipv6only", action="store_true", help="Only use IPv6 (ignore IPv4)")
+    parser.add_argument("--force-update", action="store_true", dest="force_update", help="Always run DNS update, even without detected IP change")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
-    parser.add_argument("--reason", type=str, default="Scheduled", help="Reason for the run (e.g., Gateway-Alarm)")
+    parser.add_argument("--reason", type=str, default="Scheduled", help="Reason for the run (e.g., Gateway-Event)")
     args = parser.parse_args()
 
     # === Execution ===
-    # Instantiate the correct platform implementation
     platform = PfSensePlatform()
-    updater = DynDNSUpdater(platform, config, args)
+    updater = CloudflareDynDNS(platform, config, args)
     updater.run()

@@ -1,5 +1,6 @@
 #!/usr/local/bin/python3.11
 
+import argparse
 import os
 import subprocess
 import glob
@@ -7,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 
 # --- Configuration ---
-UPDATER_SCRIPT_PATH = "/root/pdns_dyndns.py"
+DEFAULT_UPDATER_SCRIPT_PATH = "/root/pdns_dyndns.py"
 POLL_INTERVAL_SECONDS = 5
 
 # === Platform Abstraction (Copied from main script) ===
@@ -92,13 +93,14 @@ class PfSensePlatform(BasePlatform):
 # --- Main Watcher Logic ---
 
 class GatewayWatcher:
-    def __init__(self, platform):
+    def __init__(self, platform, updater_script_path):
         self.platform = platform
+        self.updater_script_path = updater_script_path
         self.previous_statuses = {}
 
     def run_updater(self):
         print(f"[{time.ctime()}] Change detected, triggering main updater script.")
-        command = [ "/usr/local/bin/python3.11", UPDATER_SCRIPT_PATH, "--force-update", "--reason=Gateway-Event" ]
+        command = [ "/usr/local/bin/python3.11", self.updater_script_path, "--force-update", "--reason=Gateway-Event" ]
         if not self.platform.is_ipv6_dyndns_configured():
             print(f"[{time.ctime()}] NOTE: No IPv6 DynDNS configurations found. Adding --ipv4only flag.")
             command.append("--ipv4only")
@@ -126,6 +128,14 @@ class GatewayWatcher:
                 self.previous_statuses = current_statuses
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="pfSense gateway state watcher daemon.")
+    parser.add_argument(
+        "--updater",
+        default=DEFAULT_UPDATER_SCRIPT_PATH,
+        help=f"Path to the DNS updater script to call on gateway changes (default: {DEFAULT_UPDATER_SCRIPT_PATH})",
+    )
+    args = parser.parse_args()
+
     platform = PfSensePlatform()
-    watcher = GatewayWatcher(platform)
+    watcher = GatewayWatcher(platform, args.updater)
     watcher.start()
