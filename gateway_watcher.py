@@ -132,7 +132,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--updater",
         default=DEFAULT_UPDATER_SCRIPT_PATH,
-        help=f"Path to the updater script to call on gateway state changes (default: {DEFAULT_UPDATER_SCRIPT_PATH})",
+        help=(
+            f"Path to a Python 3.11 updater script to invoke on gateway state changes "
+            f"(default: {DEFAULT_UPDATER_SCRIPT_PATH}). "
+            "Must be a Python 3.11 script that implements the --force-update, --reason, "
+            "and --ipv4only CLI contract (e.g. pdns_dyndns.py or cf_dyndns.py)."
+        ),
     )
     args = parser.parse_args()
 

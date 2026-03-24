@@ -14,7 +14,7 @@ This solution is designed to be fully integrated with pfSense's gateway monitori
 * **Fully Upgrade-Safe**: Does not modify any core pfSense system files, ensuring your configuration survives system updates.
 * **PowerDNS Integration**: Natively updates DNS records via the PowerDNS API (`pdns_dyndns.py`).
 * **Cloudflare Integration**: Optionally updates DNS records via the Cloudflare API with Proxy toggle support (`cf_dyndns.py`).
-* **Pluggable Updater**: `gateway_watcher.py` accepts a `--updater` flag so you can point it at any updater script without touching the watcher itself.
+* **Pluggable Updater**: `gateway_watcher.py` accepts a `--updater` flag so you can switch between the included Python 3.11 updater scripts (`pdns_dyndns.py` or `cf_dyndns.py`) without touching the watcher itself.
 * **Portable Architecture**: Platform-specific code is abstracted into a class, making it significantly easier to port the solution to other systems like OPNsense or OpenWrt.
 
 ## How It Works
