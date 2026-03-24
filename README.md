@@ -19,7 +19,7 @@ This solution is designed to be fully integrated with pfSense's gateway monitori
 
 ## How It Works
 
-This solution consists of two Python scripts that work together:
+This solution consists of a watcher and updater scripts that work together:
 
 1.  **`gateway_watcher.py` (The Trigger)**: This is a lightweight daemon that runs continuously in the background. It polls the status of the pfSense gateway monitoring sockets every few seconds. By reading your configured thresholds for latency and packet loss, it determines the true health of each gateway. When it detects a change in any gateway's status (e.g., from `online` to `down`), it instantly executes the configured updater script. By default it calls `pdns_dyndns.py`; pass `--updater /root/cf_dyndns.py` to use the Cloudflare updater instead.
 2.  **`pdns_dyndns.py` (The PowerDNS Updater)**: This is the main script that does the heavy lifting for PowerDNS. When executed, it:
