@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 import xml.etree.ElementTree as ET
 import glob
@@ -219,6 +219,11 @@ class DynDNSUpdater:
         self.config = config
         self.args = args
 
+    def _log(self, msg):
+        """Print msg unless --quiet was requested."""
+        if not self.args.quiet:
+            print(msg)
+
     def send_push_notification(self, subject, message):
         safe_message = message.replace('"', '\\"').replace("`", "'")
         php_code = f"""require_once("/etc/inc/notices.inc"); file_notice("dynupdate", "{safe_message}", "DynDNS", "", 1, false);"""
@@ -233,7 +238,7 @@ class DynDNSUpdater:
         return {}
 
     def save_state(self, ipv4, ipv6):
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         state = { "ipv4": {ip: timestamp for ip in ipv4}, "ipv6": {ip: timestamp for ip in ipv6} }
         with open(self.config['state_file'], "w") as f: json.dump(state, f)
 
@@ -253,7 +258,7 @@ class DynDNSUpdater:
             return False
 
     def run(self):
-        print(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
+        self._log(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
 
         # 1. Get all system mappings and configs from the platform
         thresholds = self.platform.get_gateway_monitoring_thresholds()
@@ -264,8 +269,8 @@ class DynDNSUpdater:
         if_to_gateway_map = {v: k for k, v in gateway_to_if_map.items()}
         dyndns_id_map = self.platform.get_dyndns_ids()
 
-        print(f"Gateway Thresholds: {thresholds}")
-        print(f"Gateway Statuses: {gateway_statuses}")
+        self._log(f"Gateway Thresholds: {thresholds}")
+        self._log(f"Gateway Statuses: {gateway_statuses}")
 
         # 2. Get all public IPs from all interfaces
         all_ipv4 = self.platform.get_public_ipv4_addresses(self.config['allowed_physical_interfaces'])
@@ -290,9 +295,9 @@ class DynDNSUpdater:
         if self.args.ipv4only: healthy_ipv6, unhealthy_ipv6 = [], set()
         if self.args.ipv6only: healthy_ipv4, unhealthy_ipv4 = [], set()
 
-        print(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
+        self._log(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
         if unhealthy_ipv4 or unhealthy_ipv6:
-            print(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
+            self._log(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
 
         # 4. Check if an update is needed and execute
         previous_state = self.load_previous_state()
@@ -300,35 +305,35 @@ class DynDNSUpdater:
         ipv6_changed = set(previous_state.get("ipv6", {}).keys()) != set(healthy_ipv6)
 
         if self.args.force_update or ipv4_changed or ipv6_changed:
-            if not self.args.force_update: print("Change detected, performing DNS update...")
-            else: print(f"Forcing DNS update (Reason: {self.args.reason})...")
+            if not self.args.force_update: self._log("Change detected, performing DNS update...")
+            else: self._log(f"Forcing DNS update (Reason: {self.args.reason})...")
 
             if self.update_dns(healthy_ipv4, healthy_ipv6):
                 self.save_state(healthy_ipv4, healthy_ipv6)
                 mappings = {'ip_to_phys': ip_to_phys_if_map, 'phys_to_pf': phys_to_pf_if_map, 'dyndns_ids': dyndns_id_map}
                 self.platform.update_cache_files(healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings)
-                print("✅ DNS update and cache files successful.")
+                self._log("✅ DNS update and cache files successful.")
                 msg = f"DynDNS for {self.config['record_name']} updated.\nHealthy IPs:\nIPv4: {healthy_ipv4}\nIPv6: {healthy_ipv6}"
                 self.send_push_notification("DynDNS Gateway Update", msg)
             else:
                 print("❌ DNS update failed.")
         else:
-            print("No changes detected. Nothing to do.")
+            self._log("No changes detected. Nothing to do.")
 
-        print("--- DynDNS script finished ---")
+        self._log("--- DynDNS script finished ---")
 
 
 if __name__ == "__main__":
     # === Configuration ===
     config = {
-        api_url = "https://pdns-api/api/v1"
-        api_key = "your_api_key_goes_here"
-        server_id = "localhost"
-        zone = "example.org."
-        record_name = "home.example.org."
-        ttl = 60
-        state_file = "/var/db/pdns-dyndns.state.json"
-        allowed_physical_interfaces = ["em0", "ixl2"]
+        'api_url': "https://pdns-api/api/v1",
+        'api_key': "your_api_key_goes_here",
+        'server_id': "localhost",
+        'zone': "example.org.",
+        'record_name': "home.example.org.",
+        'ttl': 60,
+        'state_file': "/var/db/pdns-dyndns.state.json",
+        'allowed_physical_interfaces': ["em0", "ixl2"],
     }
 
     # === Argument Parsing ===

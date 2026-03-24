@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import argparse
 import xml.etree.ElementTree as ET
 import glob
@@ -360,7 +360,7 @@ class CloudflareDynDNSUpdater:
         return {}
 
     def save_state(self, ipv4, ipv6):
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         state = { "ipv4": {ip: timestamp for ip in ipv4}, "ipv6": {ip: timestamp for ip in ipv6} }
         with open(self.config['state_file'], "w") as f: json.dump(state, f)
 
