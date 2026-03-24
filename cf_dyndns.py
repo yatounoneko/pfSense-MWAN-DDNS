@@ -4,6 +4,7 @@ import subprocess
 import re
 import urllib.request
 import urllib.error
+import urllib.parse
 import json
 import os
 from datetime import datetime
@@ -192,7 +193,7 @@ class PfSensePlatform(BasePlatform):
         ip_to_phys_if_map = mappings['ip_to_phys']
         phys_to_pf_if_map = mappings['phys_to_pf']
         dyndns_id_map = mappings['dyndns_ids']
-        
+
         all_ips_to_process = { 'healthy': healthy_ipv4 + healthy_ipv6, 'unhealthy': list(unhealthy_ipv4) + list(unhealthy_ipv6) }
         for status, ip_list in all_ips_to_process.items():
             for ip in ip_list:
@@ -202,7 +203,7 @@ class PfSensePlatform(BasePlatform):
                 if not pf_iface: continue
                 dyndns_id = dyndns_id_map.get(pf_iface)
                 if dyndns_id is None: continue
-                
+
                 cache_path = f"/conf/dyndns_{pf_iface}custom''{dyndns_id}.cache"
                 content_to_write = ip if status == 'healthy' else ip + "\n"
                 try:
@@ -222,36 +223,129 @@ def log(msg):
         print(msg)
 
 
+# === Cloudflare DNS Provider ===
 
-# === DNS Provider ===
+class CloudflareProvider:
+    """Updates DNS records on Cloudflare via API v4.
 
-class PowerDNSProvider:
-    """Updates DNS records on a PowerDNS server via its REST API."""
+    Manages multiple A/AAAA records under a single hostname, with support for
+    the Cloudflare proxy (orange-cloud) toggle via the CF_PROXIED config variable.
+    When proxied=True, TTL is automatically set to 1 (Auto) as required by Cloudflare.
+    """
 
-    def __init__(self, api_url, api_key, server_id, zone):
-        self.api_url = api_url
-        self.api_key = api_key
-        self.server_id = server_id
-        self.zone = zone
+    CF_API_BASE = "https://api.cloudflare.com/client/v4"
+
+    def __init__(self, api_token, zone_id, proxied=False):
+        self.api_token = api_token
+        self.zone_id = zone_id
+        self.proxied = proxied
+
+    def _request(self, method, path, data=None):
+        url = f"{self.CF_API_BASE}{path}"
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json"
+        }
+        body = json.dumps(data).encode('utf-8') if data is not None else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                resp_json = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            print(f"❌ Cloudflare API HTTP error {e.code} for {method} {path}: {error_body}")
+            raise
+
+        if not resp_json.get("success"):
+            errors = resp_json.get("errors", [])
+            messages = resp_json.get("messages", [])
+            print(f"❌ Cloudflare API returned success=false for {method} {path}")
+            for err in errors:
+                print(f"   Error {err.get('code')}: {err.get('message')}")
+            for msg in messages:
+                print(f"   Message: {msg.get('message', msg)}")
+            raise RuntimeError(f"Cloudflare API failure on {method} {path}: {errors}")
+
+        return resp_json
+
+    def _get_records(self, record_name, record_type):
+        name = record_name.rstrip('.')
+        query = urllib.parse.urlencode({"name": name, "type": record_type})
+        path = f"/zones/{self.zone_id}/dns_records?{query}"
+        result = self._request("GET", path)
+        return result.get('result', [])
 
     def update_records(self, record_name, ipv4_list, ipv6_list, ttl):
-        rrsets = [
-            {"name": record_name, "type": "A", "ttl": ttl, "changetype": "REPLACE",
-             "records": [{"content": ip, "disabled": False} for ip in ipv4_list]},
-            {"name": record_name, "type": "AAAA", "ttl": ttl, "changetype": "REPLACE",
-             "records": [{"content": ip, "disabled": False} for ip in ipv6_list]}
-        ]
-        try:
-            zone_url = f"{self.api_url}/servers/{self.server_id}/zones/{self.zone}"
-            data = json.dumps({"rrsets": rrsets}).encode("utf-8")
-            req = urllib.request.Request(zone_url, data=data,
-                                         headers={"X-API-Key": self.api_key, "Content-Type": "application/json"},
-                                         method="PATCH")
-            with urllib.request.urlopen(req) as response:
-                return response.status == 204
-        except Exception as e:
-            print(f"❌ Exception during PowerDNS update: {e}")
-            return False
+        name = record_name.rstrip('.')
+        # Cloudflare enforces TTL=1 (Auto) for proxied records
+        effective_ttl = 1 if self.proxied else ttl
+        success = True
+
+        for record_type, ip_list in [("A", ipv4_list), ("AAAA", ipv6_list)]:
+            try:
+                existing = self._get_records(record_name, record_type)
+            except Exception as e:
+                print(f"❌ Failed to retrieve existing Cloudflare {record_type} records: {e}")
+                success = False
+                continue
+
+            # Build content -> [records] map; detect and purge duplicates before reconciling
+            existing_by_content = {}
+            for r in existing:
+                existing_by_content.setdefault(r['content'], []).append(r)
+
+            existing_map = {}
+            for content, records in existing_by_content.items():
+                if len(records) > 1:
+                    print(f"⚠️  Found {len(records)} duplicate Cloudflare {record_type} records for {content}; cleaning up extras.")
+                    for dup in records[1:]:
+                        try:
+                            self._request("DELETE", f"/zones/{self.zone_id}/dns_records/{dup['id']}")
+                            log(f"    Deleted duplicate Cloudflare {record_type} record: {content} (id={dup['id']})")
+                        except Exception as e:
+                            print(f"    ❌ Failed to delete duplicate {record_type} record {content}: {e}")
+                            success = False
+                existing_map[content] = records[0]
+
+            desired_set = set(ip_list)
+            existing_set = set(existing_map.keys())
+
+            # Delete records that are no longer needed
+            for ip in existing_set - desired_set:
+                record_id = existing_map[ip]['id']
+                try:
+                    self._request("DELETE", f"/zones/{self.zone_id}/dns_records/{record_id}")
+                    log(f"    Deleted Cloudflare {record_type} record: {ip}")
+                except Exception as e:
+                    print(f"    ❌ Failed to delete Cloudflare {record_type} record {ip}: {e}")
+                    success = False
+
+            # Create new records or update existing ones
+            for ip in desired_set:
+                payload = {
+                    "type": record_type,
+                    "name": name,
+                    "content": ip,
+                    "ttl": effective_ttl,
+                    "proxied": self.proxied
+                }
+                if ip in existing_set:
+                    record_id = existing_map[ip]['id']
+                    try:
+                        self._request("PUT", f"/zones/{self.zone_id}/dns_records/{record_id}", payload)
+                        log(f"    Updated Cloudflare {record_type} record: {ip}")
+                    except Exception as e:
+                        print(f"    ❌ Failed to update Cloudflare {record_type} record {ip}: {e}")
+                        success = False
+                else:
+                    try:
+                        self._request("POST", f"/zones/{self.zone_id}/dns_records", payload)
+                        log(f"    Created Cloudflare {record_type} record: {ip}")
+                    except Exception as e:
+                        print(f"    ❌ Failed to create Cloudflare {record_type} record {ip}: {e}")
+                        success = False
+
+        return success
 
 
 # === Generic Application Logic ===
@@ -360,14 +454,13 @@ class DynDNSUpdater:
 
 if __name__ == "__main__":
     # === Configuration (edit these values) ===
-    PDNS_API_URL                = "https://pdns-api/api/v1"
-    PDNS_API_KEY                = "your_powerdns_api_key"
-    PDNS_SERVER_ID              = "localhost"
-    PDNS_ZONE                   = "example.com."
-    RECORD_NAME                 = "home.example.com."
-    TTL                         = 60
+    CF_API_TOKEN                = "your_cloudflare_api_token"
+    CF_ZONE_ID                  = "your_cloudflare_zone_id"
+    CF_PROXIED                  = False   # Set to True to enable Cloudflare orange-cloud proxy
+    RECORD_NAME                 = "home.example.com"  # No trailing dot — Cloudflare does not use FQDN format
+    TTL                         = 120     # Ignored when CF_PROXIED=True (Cloudflare enforces TTL=1)
     ALLOWED_PHYSICAL_INTERFACES = ["em0", "ixl2"]
-    STATE_FILE                  = "/var/db/pdns-dyndns.state.json"
+    STATE_FILE                  = "/var/db/cf-dyndns.state.json"
 
     # === Argument Parsing ===
     parser = argparse.ArgumentParser()
@@ -387,10 +480,9 @@ if __name__ == "__main__":
         'allowed_physical_interfaces': ALLOWED_PHYSICAL_INTERFACES,
         'state_file': STATE_FILE,
     }
-    dns_provider = PowerDNSProvider(PDNS_API_URL, PDNS_API_KEY, PDNS_SERVER_ID, PDNS_ZONE)
+    dns_provider = CloudflareProvider(CF_API_TOKEN, CF_ZONE_ID, proxied=CF_PROXIED)
 
     # === Execution ===
     platform = PfSensePlatform()
     updater = DynDNSUpdater(platform, config, args, dns_provider)
     updater.run()
-
