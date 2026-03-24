@@ -248,7 +248,20 @@ class CloudflareDynDNSUpdater:
         if result is None or not result.get("success"):
             print(f"❌ Failed to list {record_type} records for {name}")
             return {}
-        return {r["content"]: r["id"] for r in result.get("result", [])}
+        records = {}
+        duplicates = []
+        for r in result.get("result", []):
+            content = r.get("content")
+            record_id = r.get("id")
+            if content in records:
+                # Multiple records exist for the same IP content; mark this one for deletion.
+                duplicates.append((record_type, record_id, content))
+            else:
+                records[content] = record_id
+        # Clean up any duplicate records so only one record per IP remains.
+        for _rtype, _record_id, _ip in duplicates:
+            self._delete_record(_rtype, _record_id, _ip)
+        return records
 
     def _create_record(self, record_type, ip):
         """Create a new DNS record."""
