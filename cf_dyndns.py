@@ -34,7 +34,7 @@ class BasePlatform:
         raise NotImplementedError
     def get_dyndns_ids(self):
         raise NotImplementedError
-    def update_cache_files(self, healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings):
+    def update_cache_files(self, healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings, quiet=False):
         raise NotImplementedError
 
 class PfSensePlatform(BasePlatform):
@@ -187,8 +187,9 @@ class PfSensePlatform(BasePlatform):
             print(f"❌ Could not parse DynDNS IDs: {e}")
         return mapping
 
-    def update_cache_files(self, healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings):
-        print("Updating pfSense cache files to reflect gateway health...")
+    def update_cache_files(self, healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings, quiet=False):
+        if not quiet:
+            print("Updating pfSense cache files to reflect gateway health...")
         ip_to_phys_if_map = mappings['ip_to_phys']
         phys_to_pf_if_map = mappings['phys_to_pf']
         dyndns_id_map = mappings['dyndns_ids']
@@ -207,7 +208,8 @@ class PfSensePlatform(BasePlatform):
                 content_to_write = ip if status == 'healthy' else ip + "\n"
                 try:
                     with open(cache_path, "w") as f: f.write(content_to_write)
-                    print(f"    Wrote {cache_path} for IP {ip} with status '{status}'")
+                    if not quiet:
+                        print(f"    Wrote {cache_path} for IP {ip} with status '{status}'")
                 except Exception as e:
                     print(f"    ❌ Error writing {cache_path}: {e}")
 
@@ -226,6 +228,11 @@ class CloudflareDynDNSUpdater:
             "Authorization": f"Bearer {self.config['api_token']}",
             "Content-Type": "application/json",
         }
+
+    def _log(self, msg):
+        """Print msg unless --quiet was requested."""
+        if not self.args.quiet:
+            print(msg)
 
     def _cf_request(self, method, path, data=None):
         """Make a Cloudflare API request and return the parsed JSON response."""
@@ -280,7 +287,7 @@ class CloudflareDynDNSUpdater:
         }
         result = self._cf_request("POST", f"/zones/{zone_id}/dns_records", payload)
         if result and result.get("success"):
-            print(f"    ✅ Created {record_type} record: {ip}")
+            self._log(f"    ✅ Created {record_type} record: {ip}")
             return True
         print(f"    ❌ Failed to create {record_type} record: {ip}")
         return False
@@ -299,7 +306,7 @@ class CloudflareDynDNSUpdater:
         }
         result = self._cf_request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", payload)
         if result and result.get("success"):
-            print(f"    ✅ Updated {record_type} record: {ip}")
+            self._log(f"    ✅ Updated {record_type} record: {ip}")
             return True
         print(f"    ❌ Failed to update {record_type} record: {ip}")
         return False
@@ -309,7 +316,7 @@ class CloudflareDynDNSUpdater:
         zone_id = self.config['zone_id']
         result = self._cf_request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
         if result and result.get("success"):
-            print(f"    ✅ Deleted stale {record_type} record: {ip}")
+            self._log(f"    ✅ Deleted stale {record_type} record: {ip}")
             return True
         print(f"    ❌ Failed to delete {record_type} record: {ip}")
         return False
@@ -358,7 +365,7 @@ class CloudflareDynDNSUpdater:
         with open(self.config['state_file'], "w") as f: json.dump(state, f)
 
     def run(self):
-        print(f"--- Cloudflare DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
+        self._log(f"--- Cloudflare DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
 
         # 1. Get all system mappings and configs from the platform
         thresholds = self.platform.get_gateway_monitoring_thresholds()
@@ -369,8 +376,8 @@ class CloudflareDynDNSUpdater:
         if_to_gateway_map = {v: k for k, v in gateway_to_if_map.items()}
         dyndns_id_map = self.platform.get_dyndns_ids()
 
-        print(f"Gateway Thresholds: {thresholds}")
-        print(f"Gateway Statuses: {gateway_statuses}")
+        self._log(f"Gateway Thresholds: {thresholds}")
+        self._log(f"Gateway Statuses: {gateway_statuses}")
 
         # 2. Get all public IPs from all interfaces
         all_ipv4 = self.platform.get_public_ipv4_addresses(self.config['allowed_physical_interfaces'])
@@ -408,12 +415,12 @@ class CloudflareDynDNSUpdater:
             unhealthy_ipv4 = set()
             ipv4_changed = False
 
-        print(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
+        self._log(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
         if unhealthy_ipv4 or unhealthy_ipv6:
-            print(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
+            self._log(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
         if self.args.force_update or ipv4_changed or ipv6_changed:
-            if not self.args.force_update: print("Change detected, performing DNS update...")
-            else: print(f"Forcing DNS update (Reason: {self.args.reason})...")
+            if not self.args.force_update: self._log("Change detected, performing DNS update...")
+            else: self._log(f"Forcing DNS update (Reason: {self.args.reason})...")
 
             if self.args.dry_run:
                 print("[DRY RUN] Would update Cloudflare DNS records.")
@@ -422,17 +429,17 @@ class CloudflareDynDNSUpdater:
             elif self.update_dns(healthy_ipv4, healthy_ipv6):
                 self.save_state(healthy_ipv4, healthy_ipv6)
                 mappings = {'ip_to_phys': ip_to_phys_if_map, 'phys_to_pf': phys_to_pf_if_map, 'dyndns_ids': dyndns_id_map}
-                self.platform.update_cache_files(healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings)
-                print("✅ Cloudflare DNS update and cache files successful.")
+                self.platform.update_cache_files(healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings, quiet=self.args.quiet)
+                self._log("✅ Cloudflare DNS update and cache files successful.")
                 proxied_label = " (proxied)" if self.config.get('proxied') else ""
                 msg = f"Cloudflare DynDNS for {self.config['record_name']}{proxied_label} updated.\nHealthy IPs:\nIPv4: {healthy_ipv4}\nIPv6: {healthy_ipv6}"
                 self.send_push_notification("Cloudflare DynDNS Gateway Update", msg)
             else:
                 print("❌ Cloudflare DNS update failed.")
         else:
-            print("No changes detected. Nothing to do.")
+            self._log("No changes detected. Nothing to do.")
 
-        print("--- Cloudflare DynDNS script finished ---")
+        self._log("--- Cloudflare DynDNS script finished ---")
 
 
 if __name__ == "__main__":
