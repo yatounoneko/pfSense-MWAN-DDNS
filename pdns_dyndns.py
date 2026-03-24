@@ -188,7 +188,7 @@ class PfSensePlatform(BasePlatform):
         return mapping
 
     def update_cache_files(self, healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings):
-        print("Updating pfSense cache files to reflect gateway health...")
+        log("Updating pfSense cache files to reflect gateway health...")
         ip_to_phys_if_map = mappings['ip_to_phys']
         phys_to_pf_if_map = mappings['phys_to_pf']
         dyndns_id_map = mappings['dyndns_ids']
@@ -207,17 +207,61 @@ class PfSensePlatform(BasePlatform):
                 content_to_write = ip if status == 'healthy' else ip + "\n"
                 try:
                     with open(cache_path, "w") as f: f.write(content_to_write)
-                    print(f"    Wrote {cache_path} for IP {ip} with status '{status}'")
+                    log(f"    Wrote {cache_path} for IP {ip} with status '{status}'")
                 except Exception as e:
                     print(f"    ❌ Error writing {cache_path}: {e}")
+
+# === Output Helper ===
+# Informational messages are routed through log() so that --quiet suppresses them.
+# Error/warning messages always use print() directly.
+
+_quiet = False
+
+def log(msg):
+    if not _quiet:
+        print(msg)
+
+
+
+# === DNS Provider ===
+
+class PowerDNSProvider:
+    """Updates DNS records on a PowerDNS server via its REST API."""
+
+    def __init__(self, api_url, api_key, server_id, zone):
+        self.api_url = api_url
+        self.api_key = api_key
+        self.server_id = server_id
+        self.zone = zone
+
+    def update_records(self, record_name, ipv4_list, ipv6_list, ttl):
+        rrsets = [
+            {"name": record_name, "type": "A", "ttl": ttl, "changetype": "REPLACE",
+             "records": [{"content": ip, "disabled": False} for ip in ipv4_list]},
+            {"name": record_name, "type": "AAAA", "ttl": ttl, "changetype": "REPLACE",
+             "records": [{"content": ip, "disabled": False} for ip in ipv6_list]}
+        ]
+        try:
+            zone_url = f"{self.api_url}/servers/{self.server_id}/zones/{self.zone}"
+            data = json.dumps({"rrsets": rrsets}).encode("utf-8")
+            req = urllib.request.Request(zone_url, data=data,
+                                         headers={"X-API-Key": self.api_key, "Content-Type": "application/json"},
+                                         method="PATCH")
+            with urllib.request.urlopen(req) as response:
+                return response.status == 204
+        except Exception as e:
+            print(f"❌ Exception during PowerDNS update: {e}")
+            return False
+
 
 # === Generic Application Logic ===
 
 class DynDNSUpdater:
-    def __init__(self, platform, config, args):
+    def __init__(self, platform, config, args, dns_provider):
         self.platform = platform
         self.config = config
         self.args = args
+        self.dns_provider = dns_provider
 
     def send_push_notification(self, subject, message):
         safe_message = message.replace('"', '\\"').replace("`", "'")
@@ -238,22 +282,18 @@ class DynDNSUpdater:
         with open(self.config['state_file'], "w") as f: json.dump(state, f)
 
     def update_dns(self, ipv4_addresses, ipv6_addresses):
-        rrsets = [
-            {"name": self.config['record_name'], "type": "A", "ttl": self.config['ttl'], "changetype": "REPLACE", "records": [{"content": ip, "disabled": False} for ip in ipv4_addresses]},
-            {"name": self.config['record_name'], "type": "AAAA", "ttl": self.config['ttl'], "changetype": "REPLACE", "records": [{"content": ip, "disabled": False} for ip in ipv6_addresses]}
-        ]
-        try:
-            zone_url = f"{self.config['api_url']}/servers/{self.config['server_id']}/zones/{self.config['zone']}"
-            data = json.dumps({"rrsets": rrsets}).encode("utf-8")
-            req = urllib.request.Request(zone_url, data=data, headers={"X-API-Key": self.config['api_key'], "Content-Type": "application/json"}, method="PATCH")
-            with urllib.request.urlopen(req) as response:
-                return response.status == 204
-        except Exception as e:
-            print(f"❌ Exception during PowerDNS update: {e}")
-            return False
+        if self.args.dry_run:
+            print(f"[DRY-RUN] Would update DNS: record={self.config['record_name']}, IPv4={ipv4_addresses}, IPv6={ipv6_addresses}")
+            return True
+        return self.dns_provider.update_records(
+            self.config['record_name'],
+            ipv4_addresses,
+            ipv6_addresses,
+            self.config['ttl']
+        )
 
     def run(self):
-        print(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
+        log(f"--- DynDNS script started at {datetime.now().isoformat()} (Reason: {self.args.reason}) ---")
 
         # 1. Get all system mappings and configs from the platform
         thresholds = self.platform.get_gateway_monitoring_thresholds()
@@ -264,8 +304,8 @@ class DynDNSUpdater:
         if_to_gateway_map = {v: k for k, v in gateway_to_if_map.items()}
         dyndns_id_map = self.platform.get_dyndns_ids()
 
-        print(f"Gateway Thresholds: {thresholds}")
-        print(f"Gateway Statuses: {gateway_statuses}")
+        log(f"Gateway Thresholds: {thresholds}")
+        log(f"Gateway Statuses: {gateway_statuses}")
 
         # 2. Get all public IPs from all interfaces
         all_ipv4 = self.platform.get_public_ipv4_addresses(self.config['allowed_physical_interfaces'])
@@ -290,9 +330,9 @@ class DynDNSUpdater:
         if self.args.ipv4only: healthy_ipv6, unhealthy_ipv6 = [], set()
         if self.args.ipv6only: healthy_ipv4, unhealthy_ipv4 = [], set()
 
-        print(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
+        log(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
         if unhealthy_ipv4 or unhealthy_ipv6:
-            print(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
+            log(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
 
         # 4. Check if an update is needed and execute
         previous_state = self.load_previous_state()
@@ -300,36 +340,34 @@ class DynDNSUpdater:
         ipv6_changed = set(previous_state.get("ipv6", {}).keys()) != set(healthy_ipv6)
 
         if self.args.force_update or ipv4_changed or ipv6_changed:
-            if not self.args.force_update: print("Change detected, performing DNS update...")
-            else: print(f"Forcing DNS update (Reason: {self.args.reason})...")
+            if not self.args.force_update: log("Change detected, performing DNS update...")
+            else: log(f"Forcing DNS update (Reason: {self.args.reason})...")
 
             if self.update_dns(healthy_ipv4, healthy_ipv6):
                 self.save_state(healthy_ipv4, healthy_ipv6)
                 mappings = {'ip_to_phys': ip_to_phys_if_map, 'phys_to_pf': phys_to_pf_if_map, 'dyndns_ids': dyndns_id_map}
                 self.platform.update_cache_files(healthy_ipv4, unhealthy_ipv4, healthy_ipv6, unhealthy_ipv6, mappings)
-                print("✅ DNS update and cache files successful.")
+                log("✅ DNS update and cache files successful.")
                 msg = f"DynDNS for {self.config['record_name']} updated.\nHealthy IPs:\nIPv4: {healthy_ipv4}\nIPv6: {healthy_ipv6}"
                 self.send_push_notification("DynDNS Gateway Update", msg)
             else:
                 print("❌ DNS update failed.")
         else:
-            print("No changes detected. Nothing to do.")
+            log("No changes detected. Nothing to do.")
 
-        print("--- DynDNS script finished ---")
+        log("--- DynDNS script finished ---")
 
 
 if __name__ == "__main__":
-    # === Configuration ===
-    config = {
-        api_url = "https://pdns-api/api/v1"
-        api_key = "your_api_key_goes_here"
-        server_id = "localhost"
-        zone = "example.org."
-        record_name = "home.example.org."
-        ttl = 60
-        state_file = "/var/db/pdns-dyndns.state.json"
-        allowed_physical_interfaces = ["em0", "ixl2"]
-    }
+    # === Configuration (edit these values) ===
+    PDNS_API_URL                = "https://pdns-api/api/v1"
+    PDNS_API_KEY                = "your_powerdns_api_key"
+    PDNS_SERVER_ID              = "localhost"
+    PDNS_ZONE                   = "example.com."
+    RECORD_NAME                 = "home.example.com."
+    TTL                         = 60
+    ALLOWED_PHYSICAL_INTERFACES = ["em0", "ixl2"]
+    STATE_FILE                  = "/var/db/pdns-dyndns.state.json"
 
     # === Argument Parsing ===
     parser = argparse.ArgumentParser()
@@ -341,8 +379,18 @@ if __name__ == "__main__":
     parser.add_argument("--reason", type=str, default="Scheduled", help="Reason for the run (e.g., Gateway-Alarm)")
     args = parser.parse_args()
 
+    _quiet = args.quiet
+
+    config = {
+        'record_name': RECORD_NAME,
+        'ttl': TTL,
+        'allowed_physical_interfaces': ALLOWED_PHYSICAL_INTERFACES,
+        'state_file': STATE_FILE,
+    }
+    dns_provider = PowerDNSProvider(PDNS_API_URL, PDNS_API_KEY, PDNS_SERVER_ID, PDNS_ZONE)
+
     # === Execution ===
-    # Instantiate the correct platform implementation
     platform = PfSensePlatform()
-    updater = DynDNSUpdater(platform, config, args)
+    updater = DynDNSUpdater(platform, config, args, dns_provider)
     updater.run()
+
