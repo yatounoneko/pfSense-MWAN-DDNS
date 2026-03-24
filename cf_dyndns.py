@@ -58,7 +58,7 @@ class PfSensePlatform(BasePlatform):
                     octets = ip.split(".")
                     if ip.startswith("127.") or ip.startswith("169.254."): continue
                     if ip.startswith("10.") or ip.startswith("192.168."): continue
-                    if 172 <= int(octets[0]) <= 172 and 16 <= int(octets[1]) <= 31: continue
+                    if int(octets[0]) == 172 and 16 <= int(octets[1]) <= 31: continue
                     public_ips.append(ip)
         return public_ips
 
@@ -363,7 +363,7 @@ class DynDNSUpdater:
         try:
             subprocess.run(["/usr/local/bin/php", "-r", php_code], check=True)
         except Exception as e:
-            print(f"Push-Nachricht konnte nicht gesendet werden: {e}")
+            print(f"Failed to send push notification: {e}")
 
     def load_previous_state(self):
         if os.path.exists(self.config['state_file']):
