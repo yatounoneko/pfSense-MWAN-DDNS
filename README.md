@@ -80,7 +80,7 @@ This step configures pfSense to use your script. You must create one "Custom" Dy
     * **Service Type**: `Custom`
     * **Interface to monitor**: Select one of your WAN interfaces (e.g., `WAN`).
     * **Interface to send update from**: This should almost always be the same as the interface you are monitoring.
-    * **Hostname**: Enter your full domain name (e.g., `home.yourdomain.org`). *[2.8.1-RELEASE]Custom ruls no Hostname options
+    * **Hostname**: Enter your full domain name (e.g., `home.yourdomain.org`). *Note (pfSense 2.8.1-RELEASE): Custom entries have no Hostname field.*
     * **Update URL**: `/root/pdns_dyndns.py` (or `/root/cf_dyndns.py` for the Cloudflare path).
     * **Result Match**: `Update successful` (This is not strictly necessary as our script handles its own state, but it's good practice).
     * **Description**: A helpful description (e.g., `WAN1 DynDNS Trigger`).
