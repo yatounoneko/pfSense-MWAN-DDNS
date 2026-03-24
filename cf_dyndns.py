@@ -213,6 +213,9 @@ class PfSensePlatform(BasePlatform):
 
 # === Cloudflare DynDNS Updater ===
 
+# Timeout in seconds for all Cloudflare API HTTP requests.
+CF_API_TIMEOUT_SECONDS = 30
+
 class CloudflareDynDNSUpdater:
     def __init__(self, platform, config, args):
         self.platform = platform
@@ -230,7 +233,7 @@ class CloudflareDynDNSUpdater:
         body = json.dumps(data).encode("utf-8") if data is not None else None
         req = urllib.request.Request(url, data=body, headers=self._headers, method=method)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=CF_API_TIMEOUT_SECONDS) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
