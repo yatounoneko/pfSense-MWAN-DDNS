@@ -376,18 +376,25 @@ class CloudflareDynDNSUpdater:
         unhealthy_ipv4 = set(all_ipv4) - set(healthy_ipv4)
         unhealthy_ipv6 = set(all_ipv6) - set(healthy_ipv6)
 
-        if self.args.ipv4only: healthy_ipv6, unhealthy_ipv6 = [], set()
-        if self.args.ipv6only: healthy_ipv4, unhealthy_ipv4 = [], set()
-
-        print(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
-        if unhealthy_ipv4 or unhealthy_ipv6:
-            print(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
-
         # 4. Check if an update is needed and execute
         previous_state = self.load_previous_state()
         ipv4_changed = set(previous_state.get("ipv4", {}).keys()) != set(healthy_ipv4)
         ipv6_changed = set(previous_state.get("ipv6", {}).keys()) != set(healthy_ipv6)
 
+        # When running in IPv4-only/IPv6-only mode, preserve the previous state
+        # of the ignored IP family instead of reconciling it to an empty set.
+        if self.args.ipv4only:
+            healthy_ipv6 = list(previous_state.get("ipv6", {}).keys())
+            unhealthy_ipv6 = set()
+            ipv6_changed = False
+        if self.args.ipv6only:
+            healthy_ipv4 = list(previous_state.get("ipv4", {}).keys())
+            unhealthy_ipv4 = set()
+            ipv4_changed = False
+
+        print(f"Healthy IPs selected for update: IPv4={healthy_ipv4}, IPv6={healthy_ipv6}")
+        if unhealthy_ipv4 or unhealthy_ipv6:
+            print(f"Unhealthy IPs to be marked in cache: IPv4={list(unhealthy_ipv4)}, IPv6={list(unhealthy_ipv6)}")
         if self.args.force_update or ipv4_changed or ipv6_changed:
             if not self.args.force_update: print("Change detected, performing DNS update...")
             else: print(f"Forcing DNS update (Reason: {self.args.reason})...")
